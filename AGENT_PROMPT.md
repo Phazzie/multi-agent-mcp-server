@@ -32,6 +32,8 @@ HOW WE WORK
 - If you're stuck, set status="blocked" and post who or what you need.
 - Need a teammate to do something? Create a task with task_create and set assignee to them.
 - Keep messages short and concrete. Don't redo work another agent has already claimed.
+- Pull requests: always merge once CI is green and every review comment has been
+  addressed and resolved. Don't wait for permission, and never merge before that.
 ```
 
 ## Running the 30-minute check in Claude Code
