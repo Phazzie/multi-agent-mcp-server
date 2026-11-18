@@ -25,33 +25,62 @@ except ImportError:  # mcp 1.x
     _V2 = False
 
 DB_PATH = os.environ.get("TRIO_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "hub.db"))
+# If a Postgres URL is set (e.g. Neon on Vercel), use it instead of the SQLite file.
+DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL") or ""
+PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 
-SCHEMA = """
+_SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
-  name TEXT PRIMARY KEY, role TEXT, joined REAL, last_seen REAL);
+  name TEXT PRIMARY KEY, role TEXT, joined DOUBLE PRECISION, last_seen DOUBLE PRECISION);
 CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, recipient TEXT,
-  thread TEXT, content TEXT NOT NULL, ts REAL NOT NULL);
+  id {serial}, sender TEXT NOT NULL, recipient TEXT,
+  thread TEXT, content TEXT NOT NULL, ts DOUBLE PRECISION NOT NULL);
 CREATE TABLE IF NOT EXISTS cursors (
   agent TEXT PRIMARY KEY, last_read INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS tasks (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT,
+  id {serial}, title TEXT NOT NULL, description TEXT,
   status TEXT NOT NULL DEFAULT 'open', assignee TEXT, created_by TEXT,
-  created REAL, updated REAL);
+  created DOUBLE PRECISION, updated DOUBLE PRECISION);
 CREATE TABLE IF NOT EXISTS task_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER, agent TEXT, note TEXT, ts REAL);
+  id {serial}, task_id INTEGER, agent TEXT, note TEXT, ts DOUBLE PRECISION);
 CREATE TABLE IF NOT EXISTS notes (
-  key TEXT PRIMARY KEY, content TEXT, updated_by TEXT, updated REAL);
+  key TEXT PRIMARY KEY, content TEXT, updated_by TEXT, updated DOUBLE PRECISION);
 """
+SCHEMA = _SCHEMA.format(serial="SERIAL PRIMARY KEY" if PG else "INTEGER PRIMARY KEY AUTOINCREMENT")
 
 STATUSES = ("open", "in_progress", "blocked", "review", "done")
 
 
+class _PGConn:
+    """Tiny adapter so the same '?'-style SQL runs on Postgres."""
+
+    def __init__(self):
+        import psycopg
+        from psycopg.rows import dict_row
+        self._c = psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=False)
+
+    def execute(self, sql, args=()):
+        return self._c.execute(sql.replace("?", "%s"), args)
+
+    def executescript(self, sql):
+        for stmt in filter(str.strip, sql.split(";")):
+            self._c.execute(stmt)
+
+    def commit(self):
+        self._c.commit()
+
+    def close(self):
+        self._c.close()
+
+
 @contextmanager
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    if PG:
+        conn = _PGConn()
+    else:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
     try:
         yield conn
         conn.commit()
@@ -131,11 +160,11 @@ def post(agent: str, content: str, to: str = "", thread: str = "") -> str:
     """Send a message. Leave `to` empty to broadcast to everyone, or name one agent. `thread` optionally groups a topic."""
     with db() as c:
         _touch(c, agent)
-        cur = c.execute(
-            "INSERT INTO messages(sender, recipient, thread, content, ts) VALUES(?,?,?,?,?)",
+        mid = c.execute(
+            "INSERT INTO messages(sender, recipient, thread, content, ts) VALUES(?,?,?,?,?) RETURNING id",
             (agent, to or None, thread or None, content, time.time()),
-        )
-    return f"Posted message #{cur.lastrowid}."
+        ).fetchone()["id"]
+    return f"Posted message #{mid}."
 
 
 @mcp.tool()
@@ -153,7 +182,7 @@ def inbox(agent: str, include_seen: bool = False, limit: int = 50) -> str:
         if rows:
             c.execute(
                 "INSERT INTO cursors(agent, last_read) VALUES(?, ?) "
-                "ON CONFLICT(agent) DO UPDATE SET last_read=MAX(cursors.last_read, excluded.last_read)",
+                "ON CONFLICT(agent) DO UPDATE SET last_read=CASE WHEN excluded.last_read > cursors.last_read THEN excluded.last_read ELSE cursors.last_read END",
                 (agent, rows[-1]["id"]),
             )
     return "\n".join(_fmt_msg(r) for r in rows) if rows else "No new messages."
@@ -177,11 +206,10 @@ def task_create(agent: str, title: str, description: str = "", assignee: str = "
     now = time.time()
     with db() as c:
         _touch(c, agent)
-        cur = c.execute(
-            "INSERT INTO tasks(title, description, assignee, created_by, created, updated) VALUES(?,?,?,?,?,?)",
+        tid = c.execute(
+            "INSERT INTO tasks(title, description, assignee, created_by, created, updated) VALUES(?,?,?,?,?,?) RETURNING id",
             (title, description, assignee or None, agent, now, now),
-        )
-        tid = cur.lastrowid
+        ).fetchone()["id"]
         c.execute("INSERT INTO task_log(task_id, agent, note, ts) VALUES(?,?,?,?)", (tid, agent, "created", now))
         if assignee:
             c.execute(
